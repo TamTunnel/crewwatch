@@ -3,6 +3,8 @@
 A persistent manager agent that owns an engineering goal end-to-end on
 free local coding agents — and proves what it did.
 
+**Demo:** https://tamtunnel.github.io/crewwatch/ — a real goal run with a signed receipt, plus the eval harness results.
+
 ## The problem
 
 Devin Bots proved the manager-agent pattern works, then gated it behind
