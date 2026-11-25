@@ -1,0 +1,20 @@
+{
+  "title": "Fix the Add bug in calc",
+  "repo": "/path/to/your/calc-repo",
+  "adapter": "opencode",
+  "timeout_secs": 600,
+  "tasks": [
+    {
+      "title": "Fix Add returning a-b",
+      "acceptance": "Add(a, b) returns a+b; go test ./... passes.",
+      "verify_cmd": "go test ./...",
+      "max_attempts": 3
+    },
+    {
+      "title": "Add Multiply",
+      "acceptance": "Multiply(a, b) returns a*b; go test ./... passes.",
+      "verify_cmd": "go test ./...",
+      "max_attempts": 3
+    }
+  ]
+}
