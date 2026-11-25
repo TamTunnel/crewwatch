@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/TamTunnel/crewwatch/internal/adapter"
@@ -39,6 +38,10 @@ type Spec struct {
 	Adapter     string     `json:"adapter"`
 	TimeoutSecs int        `json:"timeout_secs"`
 	Tasks       []TaskSpec `json:"tasks"`
+	// AllowScript permits tasks with script_cmd. It is set only by
+	// `goal add --allow-script` or the eval harness (internal path);
+	// a spec file alone can never enable it.
+	AllowScript bool `json:"-"`
 }
 
 // TaskSpec is one task inside a goal spec.
@@ -77,16 +80,37 @@ func New(home string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	alog, err := audit.Open(filepath.Join(home, "audit.jsonl"))
+	// Audit HMAC key (0600, generated on first use, kept out of the log).
+	auditKey, err := audit.LoadOrCreateKey(home)
 	if err != nil {
 		store.Close()
 		return nil, err
+	}
+	// Open runs the same full verification as `audit verify`, and
+	// refuses a truncated or tampered log. A file with MORE entries
+	// than SQLite recorded is a crash between file append and SQLite
+	// update: accept it and re-sync SQLite from the file.
+	expHead, _ := store.GetMeta("audit_head")
+	expCount, _ := store.GetMeta("audit_count")
+	alog, err := audit.Open(filepath.Join(home, "audit.jsonl"), auditKey, expHead, audit.ParseCount(expCount))
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	if alog.Head() != expHead || alog.Count() != audit.ParseCount(expCount) {
+		_ = store.SetMeta("audit_head", alog.Head())
+		_ = store.SetMeta("audit_count", fmt.Sprintf("%d", alog.Count()))
 	}
 	priv, err := receipt.LoadOrCreateKey(home)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
+	// Pin the operator public key: key.pub on disk + fingerprint in
+	// SQLite meta. Replacing key.pem/key.pub is a revocation event —
+	// receipts from before the rotation fail verification by design.
+	pub := priv.Public().(ed25519.PublicKey)
+	_ = store.SetMeta("key_fingerprint", receipt.KeyID(pub))
 	// Register the default adapters (idempotent).
 	for _, d := range adapter.DefaultAdapters() {
 		args, _ := json.Marshal(d.Args)
@@ -97,6 +121,11 @@ func New(home string) (*Manager, error) {
 		}
 	}
 	return &Manager{Home: home, Store: store, Audit: alog, Priv: priv}, nil
+}
+
+// PinnedKey returns the operator public key pinned for this home.
+func (m *Manager) PinnedKey() ed25519.PublicKey {
+	return m.Priv.Public().(ed25519.PublicKey)
 }
 
 // Close releases state.
@@ -117,7 +146,15 @@ func (m *Manager) auditEvent(event string, fields map[string]any) {
 			payload[k] = v
 		}
 	}
-	_, _ = m.Audit.Append(payload)
+	e, err := m.Audit.Append(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "crewwatch: audit append failed: %v\n", err)
+		return
+	}
+	// File first, then SQLite: the expected head hash + entry count
+	// are the truncation anchor checked on the next open.
+	_ = m.Store.SetMeta("audit_head", e.EntryHash)
+	_ = m.Store.SetMeta("audit_count", fmt.Sprintf("%d", e.Seq))
 }
 
 // --- goal intake ---
@@ -147,6 +184,20 @@ func (m *Manager) AddGoal(spec *Spec) (*state.Goal, error) {
 			return nil, fmt.Errorf("goal: %w", err)
 		}
 	}
+	// Secrets must never be pasted into a spec: the spec is stored
+	// verbatim in SQLite. Reject with a clear error telling the
+	// operator to pass secrets via environment variables instead.
+	if rawSpec, err := json.Marshal(spec); err == nil && redact.ContainsSecret(string(rawSpec)) {
+		return nil, fmt.Errorf("goal: spec contains a value that looks like a secret (API key/token) — do not paste secrets into specs; pass them via environment variables instead (e.g. *_API_KEY, which workers receive and which are redacted from transcripts)")
+	}
+	// script_cmd runs arbitrary sh -c and bypasses the pinned-adapter
+	// boundary. It is allowed only via --allow-script (harness and
+	// internal/test path), never from an ordinary spec file.
+	for i := range spec.Tasks {
+		if spec.Tasks[i].ScriptCmd != "" && !spec.AllowScript {
+			return nil, fmt.Errorf("goal: task %q contains script_cmd, which runs arbitrary commands — pass --allow-script to allow it (harness/internal use only)", spec.Tasks[i].Title)
+		}
+	}
 	if spec.TimeoutSecs <= 0 {
 		spec.TimeoutSecs = 600
 	}
@@ -160,6 +211,14 @@ func (m *Manager) AddGoal(spec *Spec) (*state.Goal, error) {
 		}
 		if t.VerifyCmd == "" {
 			return nil, fmt.Errorf("goal: task %q has no verify_cmd and no default could be detected for repo %q (add go test / npm test support or set verify_cmd)", t.Title, spec.Repo)
+		}
+		// Toolchain preflight (F1): fail fast with a clear error if
+		// the binary named in verify_cmd is not on PATH, instead of
+		// burning the attempt budget on exit 127.
+		if bin := firstWord(t.VerifyCmd); bin != "" {
+			if _, err := exec.LookPath(bin); err != nil {
+				return nil, fmt.Errorf("goal: task %q verify_cmd %q requires %q, which was not found on PATH — install it or fix verify_cmd before adding the goal", t.Title, t.VerifyCmd, bin)
+			}
 		}
 		if t.MaxAttempts <= 0 {
 			t.MaxAttempts = 3
@@ -191,6 +250,17 @@ func (m *Manager) AddGoal(spec *Spec) (*state.Goal, error) {
 	return g, nil
 }
 
+// firstWord returns the first whitespace-separated word of s, with
+// surrounding quotes stripped.
+func firstWord(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	w := strings.Fields(s)[0]
+	return strings.Trim(w, `"'`)
+}
+
 // defaultVerifyCmd detects the repo's test command.
 func defaultVerifyCmd(repo string) string {
 	if _, err := os.Stat(filepath.Join(repo, "go.mod")); err == nil {
@@ -209,13 +279,26 @@ func defaultVerifyCmd(repo string) string {
 // goals that arrived taskless. It asks the goal's adapter to propose a
 // task list as JSON; anything unparseable or empty fails the goal closed
 // with zero dispatches.
+//
+// The worker NEVER chooses the verification command (B4): every
+// decomposed task gets verify_cmd from the repo-detected default (the
+// same defaultVerifyCmd intake uses). A task with no detectable
+// verify_cmd is dropped, with an audit event and a stderr line —
+// never silently. Decomposed tasks are validated the same way intake
+// validates them (title required, attempt budget defaulted, toolchain
+// preflight). The raw decomposition JSON is logged as an audit event
+// so the DAG decision is recorded for replay/audit; decomposition
+// itself is nondeterministic by design (LLM output) for taskless
+// goals — probe 17's determinism guarantee covers explicit-task specs.
 func (m *Manager) decompose(ctx context.Context, g *state.Goal) error {
 	var spec Spec
 	if err := json.Unmarshal([]byte(g.SpecJSON), &spec); err != nil {
 		return m.blockGoal(g, fmt.Sprintf("bad spec: %v", err))
 	}
+	// The prompt must not ask for verify_cmd: worker output is never
+	// trusted to pick the verification command.
 	prompt := "Decompose this engineering goal into concrete tasks. " +
-		"Reply with ONLY a JSON array of objects with keys title, acceptance, verify_cmd. " +
+		"Reply with ONLY a JSON array of objects with keys title, acceptance. " +
 		"Goal: " + spec.Title + "\nRepo: " + spec.Repo
 	ad, err := m.adapterFor(&state.Task{Adapter: spec.Adapter})
 	if err != nil {
@@ -223,31 +306,43 @@ func (m *Manager) decompose(ctx context.Context, g *state.Goal) error {
 	}
 	work := filepath.Join(m.Home, "worktrees", "decompose-"+g.ID)
 	_ = os.MkdirAll(work, 0o700)
+	// Pid file so CancelGoal can kill a decomposition in flight (S6).
+	pidFile := filepath.Join(m.Home, "running", "decompose-"+g.ID+".pid")
+	fmt.Fprintln(os.Stderr, Disclosure)
 	res, err := ad.Dispatch(ctx, adapter.Request{
 		TaskID: "decompose-" + g.ID, Title: "decompose", WorkDir: work,
-		Prompt: prompt, Timeout: 5 * time.Minute,
+		Prompt: prompt, Timeout: 5 * time.Minute, PIDFile: pidFile,
 	})
+	// The scratch dir is cleaned after extraction, success or failure.
+	defer os.RemoveAll(work)
 	if err != nil {
 		return m.blockGoal(g, fmt.Sprintf("decomposition failed: %v", err))
 	}
+	m.auditEvent("decomposition_raw", map[string]any{"goal_id": g.ID, "raw": res.Transcript})
 	var tasks []TaskSpec
 	if err := extractJSONArray(res.Transcript, &tasks); err != nil || len(tasks) == 0 {
 		return m.blockGoal(g, "goal could not be decomposed into tasks (no parseable task list); failing closed with zero dispatches")
 	}
+	created := 0
 	for _, ts := range tasks {
 		if strings.TrimSpace(ts.Title) == "" {
+			m.dropTask(g, ts, "empty title")
 			continue
 		}
+		// verify_cmd comes from the repo, never from worker output.
+		ts.VerifyCmd = defaultVerifyCmd(spec.Repo)
 		if ts.VerifyCmd == "" {
-			ts.VerifyCmd = defaultVerifyCmd(spec.Repo)
+			m.dropTask(g, ts, "no verify_cmd could be detected for the repo")
+			continue
 		}
-		if ts.VerifyCmd == "" || ts.MaxAttempts <= 0 {
-			if ts.MaxAttempts <= 0 {
-				ts.MaxAttempts = 3
-			}
-			if ts.VerifyCmd == "" {
+		if bin := firstWord(ts.VerifyCmd); bin != "" {
+			if _, err := exec.LookPath(bin); err != nil {
+				m.dropTask(g, ts, fmt.Sprintf("verify_cmd binary %q not found on PATH", bin))
 				continue
 			}
+		}
+		if ts.MaxAttempts <= 0 {
+			ts.MaxAttempts = 3
 		}
 		t := &state.Task{
 			ID: newID("task"), GoalID: g.ID, Title: ts.Title,
@@ -257,9 +352,20 @@ func (m *Manager) decompose(ctx context.Context, g *state.Goal) error {
 		if err := m.Store.CreateTask(t); err != nil {
 			return err
 		}
+		created++
 	}
-	m.auditEvent("goal_decomposed", map[string]any{"goal_id": g.ID, "tasks": int64(len(tasks))})
+	if created == 0 {
+		return m.blockGoal(g, "decomposition produced no usable tasks (all dropped — see audit log); failing closed with zero dispatches")
+	}
+	m.auditEvent("goal_decomposed", map[string]any{"goal_id": g.ID, "tasks": int64(created), "dropped": int64(len(tasks) - created)})
 	return nil
+}
+
+// dropTask logs a dropped decomposed task (audit + stderr), never
+// silently shrinking the DAG.
+func (m *Manager) dropTask(g *state.Goal, ts TaskSpec, reason string) {
+	m.auditEvent("task_dropped", map[string]any{"goal_id": g.ID, "title": ts.Title, "reason": reason})
+	fmt.Fprintf(os.Stderr, "crewwatch: dropped decomposed task %q: %s\n", ts.Title, reason)
 }
 
 func (m *Manager) blockGoal(g *state.Goal, reason string) error {
@@ -360,14 +466,20 @@ func (m *Manager) RunUntilIdle(ctx context.Context) error {
 
 // reapStale recovers from a dead daemon: tasks left in dispatched or
 // verifying, and their running attempts, are marked interrupted and the
-// tasks return to pending. No new attempt is created here, so attempt
-// counts prove no duplicated dispatches.
+// tasks return to pending — unless the attempt budget is already spent,
+// in which case the task escalates (a crash-looping task must escalate,
+// never retry forever). Before marking anything interrupted, the stale
+// worker's process group is SIGKILLed via its pid file (the pid file
+// survives kill -9 of the daemon), so a restarted daemon never
+// dispatches a second worker while the first is alive. No new attempt
+// is created here, so attempt counts prove no duplicated dispatches.
 func (m *Manager) reapStale() error {
 	running, err := m.Store.RunningAttempts()
 	if err != nil {
 		return err
 	}
 	for _, a := range running {
+		m.killStaleWorker(a.TaskID)
 		a.Status = state.AttemptInterrupted
 		a.EndedAt = time.Now().Unix()
 		if err := m.Store.FinishAttempt(a); err != nil {
@@ -383,12 +495,52 @@ func (m *Manager) reapStale() error {
 		if err != nil || g.Status != state.GoalRunning {
 			continue
 		}
+		used, err := m.Store.CountAllAttempts(t.ID)
+		if err != nil {
+			return err
+		}
+		if used >= t.MaxAttempts {
+			if err := m.escalate(t, g, fmt.Sprintf("attempt budget spent (%d dispatches, including interrupted attempts) after crash recovery — escalated, never retried forever", used)); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := m.Store.SetTaskStatus(t.ID, state.TaskPending); err != nil {
 			return err
 		}
 		m.auditEvent("task_recovered", map[string]any{"task_id": t.ID, "goal_id": t.GoalID})
 	}
 	return nil
+}
+
+// killStaleWorker SIGKILLs the process group (and any descendants,
+// including setsid grandchildren) recorded in the task's pid file,
+// then removes the pid file. The pid file survives kill -9 of the
+// daemon, which is what makes this recovery possible.
+func (m *Manager) killStaleWorker(taskID string) {
+	pidFile := filepath.Join(m.Home, "running", taskID+".pid")
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		return
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(raw), "%d", &pid); err == nil && pid > 0 {
+		adapter.KillTree(pid)
+	}
+	_ = os.Remove(pidFile)
+}
+
+// readPIDFile returns the pid recorded in a pid file, if any.
+func readPIDFile(path string) (int, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(raw), "%d", &pid); err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
 }
 
 // --- task processing ---
@@ -446,10 +598,13 @@ func (m *Manager) processTask(ctx context.Context, t *state.Task) error {
 	}
 	fmt.Fprintln(os.Stderr, Disclosure)
 
-	// Snapshot the main checkout: a worker that writes outside its
-	// worktree is an escape. There is no sandbox in v1, so the manager
-	// detects the escape and escalates instead of attributing it.
-	beforeStatus := m.repoStatusHash(g.Repo)
+	// Snapshots taken BEFORE dispatch, for the two post-dispatch
+	// checks below: the escape snapshot covers the main checkout
+	// (tracked files + .git/hooks), every other live worktree, and
+	// the state home's top level; the test snapshot covers the
+	// worktree's test files as committed at HEAD.
+	beforeEscape := m.escapeSnapshot(g.Repo, worktree)
+	beforeTests := m.testFileSnapshot(worktree)
 
 	// Last check before dispatch: the goal may have been cancelled while
 	// the worktree was being set up. Never dispatch into a dead goal.
@@ -473,7 +628,25 @@ func (m *Manager) processTask(ctx context.Context, t *state.Task) error {
 		TaskID: t.ID, Title: t.Title, Acceptance: t.Acceptance,
 		WorkDir: worktree, Prompt: prompt, Timeout: timeout, PIDFile: pidFile,
 	})
+	if res == nil {
+		res = &adapter.Result{ExitCode: -1}
+	}
 	m.auditEvent("task_dispatched", map[string]any{"task_id": t.ID, "goal_id": t.GoalID, "adapter": ad.Name(), "attempt": attempt.ID})
+
+	// Post-dispatch integrity checks, before any verification: a
+	// worker that wrote outside its worktree, or that touched the
+	// test files, escalates — even if dispatch itself failed. There
+	// is no sandbox in v1, so this is detection, not prevention.
+	if reason := m.checkWorkerChanges(g.Repo, worktree, beforeEscape, beforeTests); reason != "" {
+		attempt.Status = state.AttemptFailed
+		attempt.EndedAt = time.Now().Unix()
+		attempt.ExitCode = res.ExitCode
+		attempt.DurationMs = res.DurationMs
+		if err := m.Store.FinishAttempt(attempt); err != nil {
+			return err
+		}
+		return m.escalate(t, g, reason)
+	}
 	if dispatchErr != nil {
 		attempt.Status = state.AttemptFailed
 		attempt.EndedAt = time.Now().Unix()
@@ -508,19 +681,6 @@ func (m *Manager) processTask(ctx context.Context, t *state.Task) error {
 			_ = m.Store.SetTaskStatus(t.ID, state.TaskCancelled)
 		}
 		return nil
-	}
-
-	// Worktree escape: the main checkout must be exactly as it was.
-	if after := m.repoStatusHash(g.Repo); after != beforeStatus {
-		attempt.Status = state.AttemptFailed
-		attempt.EndedAt = time.Now().Unix()
-		attempt.ExitCode = res.ExitCode
-		attempt.DurationMs = res.DurationMs
-		attempt.TranscriptRef = transcriptPath
-		if err := m.Store.FinishAttempt(attempt); err != nil {
-			return err
-		}
-		return m.escalate(t, g, "worker wrote outside its worktree (main checkout changed) — escalated")
 	}
 
 	// Diff hash of the worktree vs HEAD.
@@ -592,26 +752,20 @@ func emptySHA256() string {
 }
 
 // failOrEscalate retries a failed task until its attempt budget is spent,
-// then escalates it to the human and blocks the goal.
+// then escalates it to the human and blocks the goal. The budget counts
+// EVERY dispatch — completed, failed, timed out, and interrupted — so a
+// task interrupted on every attempt (crash loop) escalates instead of
+// retrying forever.
 func (m *Manager) failOrEscalate(t *state.Task, g *state.Goal, reason string) error {
 	// A cancelled goal must never be retried or re-blocked.
 	if g2, err := m.Store.GetGoal(g.ID); err == nil && g2.Status == state.GoalCancelled {
 		_ = m.Store.SetTaskStatus(t.ID, state.TaskCancelled)
 		return nil
 	}
-	done, err := m.Store.CountAttempts(t.ID, state.AttemptCompleted)
+	used, err := m.Store.CountAllAttempts(t.ID)
 	if err != nil {
 		return err
 	}
-	failed, err := m.Store.CountAttempts(t.ID, state.AttemptFailed)
-	if err != nil {
-		return err
-	}
-	timedOut, err := m.Store.CountAttempts(t.ID, state.AttemptTimeout)
-	if err != nil {
-		return err
-	}
-	used := done + failed + timedOut
 	if used < t.MaxAttempts {
 		if err := m.Store.SetTaskStatus(t.ID, state.TaskPending); err != nil {
 			return err
@@ -651,6 +805,7 @@ func (m *Manager) closeTask(t *state.Task, g *state.Goal, attempt *state.Attempt
 		DiffSHA256:    diffHash, VerifyCmd: t.VerifyCmd,
 		VerifiedAt: time.Now().Unix(), DurationMs: attempt.DurationMs,
 		CostTokens: attempt.CostTokens, CostUSD: attempt.CostUSD,
+		WorkerExitCode: attempt.ExitCode,
 	}
 	r, err := receipt.Sign(payload, m.Priv)
 	if err != nil {
@@ -711,25 +866,240 @@ func (m *Manager) runVerify(dir, cmdline string) (string, error) {
 	return string(out), nil
 }
 
-// diffHash returns the sha256 of `git diff HEAD` in the worktree.
+// diffHash returns the sha256 of the worktree's changes vs HEAD,
+// including untracked files: `git diff HEAD` alone excludes untracked
+// files, so a new-file-only change used to hash as "no change". The
+// hash covers the diff, the status porcelain, and the contents of
+// every untracked file.
 func (m *Manager) diffHash(worktree string) string {
-	out, err := exec.Command("git", "-C", worktree, "diff", "HEAD").Output()
+	h := sha256.New()
+	if out, err := exec.Command("git", "-C", worktree, "diff", "HEAD").Output(); err == nil {
+		h.Write(out)
+	}
+	status, err := exec.Command("git", "-C", worktree, "status", "--porcelain").Output()
 	if err != nil {
 		return emptySHA256()
 	}
-	sum := sha256.Sum256(out)
-	return hex.EncodeToString(sum[:])
+	h.Write(status)
+	for _, line := range strings.Split(string(status), "\n") {
+		if len(line) < 4 || !strings.HasPrefix(line, "??") {
+			continue
+		}
+		p := strings.TrimSpace(line[2:])
+		// Untracked dirs are listed with a trailing slash; hash
+		// every file under them.
+		full := filepath.Join(worktree, p)
+		_ = filepath.Walk(full, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(worktree, path)
+			h.Write([]byte(rel))
+			if raw, err := os.ReadFile(path); err == nil {
+				h.Write(raw)
+			}
+			return nil
+		})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-// repoStatusHash returns the sha256 of `git status --porcelain` for the
-// main checkout — used to detect a worker escaping its worktree.
-func (m *Manager) repoStatusHash(repo string) string {
-	out, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output()
-	if err != nil {
-		return ""
+// isTestFile reports whether a repo-relative path is a test file. Any
+// change to one by a worker escalates the task (B3): the pre-existing
+// suite must pass unchanged.
+func isTestFile(p string) bool {
+	base := filepath.Base(p)
+	if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
+		strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.rb") ||
+		strings.HasSuffix(base, ".test.js") || strings.HasSuffix(base, ".test.ts") ||
+		strings.HasSuffix(base, ".spec.js") || strings.HasSuffix(base, ".spec.ts") {
+		return true
 	}
-	sum := sha256.Sum256(out)
-	return hex.EncodeToString(sum[:])
+	for _, part := range strings.Split(filepath.ToSlash(p), "/") {
+		if part == "test" || part == "tests" || part == "__tests__" {
+			return true
+		}
+	}
+	return false
+}
+
+// testFileSnapshot returns path → sha256 of the worktree's test files
+// as committed at HEAD. The baseline is HEAD, not the current
+// worktree, so a worker that guts the tests on a retry is still
+// caught: the comparison is always against the pristine suite.
+func (m *Manager) testFileSnapshot(worktree string) map[string]string {
+	snap := map[string]string{}
+	out, err := exec.Command("git", "-C", worktree, "ls-tree", "-r", "--name-only", "HEAD").Output()
+	if err != nil {
+		return snap
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" || !isTestFile(line) {
+			continue
+		}
+		content, err := exec.Command("git", "-C", worktree, "show", "HEAD:"+line).Output()
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(content)
+		snap[line] = hex.EncodeToString(sum[:])
+	}
+	return snap
+}
+
+// currentTestFiles returns path → sha256 of the test files currently
+// on disk in the worktree (tracked or untracked).
+func (m *Manager) currentTestFiles(worktree string) map[string]string {
+	snap := map[string]string{}
+	_ = filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(worktree, path)
+		if err != nil || !isTestFile(rel) {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		sum := sha256.Sum256(raw)
+		snap[filepath.ToSlash(rel)] = hex.EncodeToString(sum[:])
+		return nil
+	})
+	return snap
+}
+
+// escapeSnapshot inventories everything a worker must not touch:
+// the main checkout (all files, including gitignored ones, plus the
+// .git/hooks dir), every OTHER live worktree dir, and the state home's
+// top-level files (excluding manager-written state: transcripts,
+// receipts, running, worktrees, the DB, the audit log, keys, lock).
+// Each file is recorded as size:mtime-nanos:content-sha256, so a
+// write-then-restore is still detected via the mtime.
+func (m *Manager) escapeSnapshot(repo, ownWorktree string) map[string]string {
+	snap := map[string]string{}
+	inventory := func(root string, skip func(rel string) bool) {
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return nil
+			}
+			if rel == "." {
+				return nil
+			}
+			if info.IsDir() {
+				if skip != nil && skip(rel) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if skip != nil && skip(rel) {
+				return nil
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			sum := sha256.Sum256(raw)
+			snap[path] = fmt.Sprintf("%d:%d:%s", info.Size(), info.ModTime().UnixNano(), hex.EncodeToString(sum[:]))
+			return nil
+		})
+	}
+	// Main checkout: everything except .git internals other than hooks.
+	inventory(repo, func(rel string) bool {
+		if rel == ".git" {
+			return false // do not skip the dir itself; skip its children below
+		}
+		if strings.HasPrefix(rel, ".git"+string(os.PathSeparator)) {
+			return !strings.HasPrefix(rel, filepath.Join(".git", "hooks")+string(os.PathSeparator)) &&
+				rel != filepath.Join(".git", "hooks")
+		}
+		return false
+	})
+	// Other live worktrees.
+	wtRoot := filepath.Join(m.Home, "worktrees")
+	if entries, err := os.ReadDir(wtRoot); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			dir := filepath.Join(wtRoot, e.Name())
+			if dir == ownWorktree {
+				continue
+			}
+			inventory(dir, func(rel string) bool { return rel == ".git" })
+		}
+	}
+	// State home top level (files only, one level deep).
+	if entries, err := os.ReadDir(m.Home); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			switch e.Name() {
+			case "crewwatch.db", "crewwatch.db-wal", "crewwatch.db-shm",
+				"audit.jsonl", "key.pem", "key.pub", "audit.key", "daemon.lock":
+				continue
+			}
+			p := filepath.Join(m.Home, e.Name())
+			if info, err := os.Stat(p); err == nil {
+				if raw, err := os.ReadFile(p); err == nil {
+					sum := sha256.Sum256(raw)
+					snap[p] = fmt.Sprintf("%d:%d:%s", info.Size(), info.ModTime().UnixNano(), hex.EncodeToString(sum[:]))
+				}
+			}
+		}
+	}
+	return snap
+}
+
+// diffSnapshots lists paths that were added, deleted, or changed
+// between two snapshots (at most 10 shown).
+func diffSnapshots(before, after map[string]string) []string {
+	var changed []string
+	for p, h := range after {
+		if before[p] != h {
+			changed = append(changed, p)
+		}
+	}
+	for p := range before {
+		if _, ok := after[p]; !ok {
+			changed = append(changed, p+" (deleted)")
+		}
+	}
+	if len(changed) > 10 {
+		changed = append(changed[:10], fmt.Sprintf("... and %d more", len(changed)-10))
+	}
+	return changed
+}
+
+// checkWorkerChanges compares the post-dispatch snapshots against the
+// pre-dispatch ones. It returns "" when nothing changed, otherwise an
+// escalation reason. Test-file changes are checked first: any change
+// to test files escalates the task, and the pre-existing suite must
+// pass unchanged.
+func (m *Manager) checkWorkerChanges(repo, worktree string, beforeEscape, beforeTests map[string]string) string {
+	afterTests := m.currentTestFiles(worktree)
+	if changed := diffSnapshots(beforeTests, afterTests); len(changed) > 0 {
+		m.auditEvent("test_files_changed", map[string]any{"repo": repo, "changed": strings.Join(changed, ", ")})
+		return fmt.Sprintf("worker modified test files (%s) — the pre-existing test suite must pass unchanged; escalated", strings.Join(changed, ", "))
+	}
+	afterEscape := m.escapeSnapshot(repo, worktree)
+	if changed := diffSnapshots(beforeEscape, afterEscape); len(changed) > 0 {
+		m.auditEvent("worktree_escape", map[string]any{"repo": repo, "changed": strings.Join(changed, ", ")})
+		return fmt.Sprintf("worker wrote outside its worktree (%s) — escalated", strings.Join(changed, ", "))
+	}
+	return ""
 }
 
 // --- worktrees ---
@@ -766,7 +1136,7 @@ func (m *Manager) ReapOrphans() error {
 	}
 	live := map[string]bool{}
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), "decompose-") {
+		if !e.IsDir() {
 			continue
 		}
 		t, err := m.Store.GetTask(e.Name())
@@ -807,13 +1177,16 @@ func (m *Manager) CancelGoal(goalID string) error {
 		if t.Status == state.TaskDone {
 			continue
 		}
-		// Kill the running worker's process group, if any.
-		if raw, err := os.ReadFile(filepath.Join(m.Home, "running", t.ID+".pid")); err == nil {
-			var pid int
-			if _, err := fmt.Sscanf(string(raw), "%d", &pid); err == nil && pid > 0 {
-				_ = syscall.Kill(-pid, syscall.SIGKILL)
-			}
+		// Kill the running worker's process tree (group + /proc
+		// descendants, including setsid grandchildren), if any.
+		if pid, ok := readPIDFile(filepath.Join(m.Home, "running", t.ID+".pid")); ok {
+			adapter.KillTree(pid)
 			_ = os.Remove(filepath.Join(m.Home, "running", t.ID+".pid"))
+		}
+		// A decomposition in flight for this goal has its own pid file.
+		if pid, ok := readPIDFile(filepath.Join(m.Home, "running", "decompose-"+goalID+".pid")); ok {
+			adapter.KillTree(pid)
+			_ = os.Remove(filepath.Join(m.Home, "running", "decompose-"+goalID+".pid"))
 		}
 		if t.Status == state.TaskDispatched || t.Status == state.TaskVerifying {
 			running, _ := m.Store.RunningAttempts()

@@ -82,6 +82,22 @@ non-interactive modes (`opencode run`, `qwen -p`, `claude -p`,
 `CREWWATCH_ADAPTER_<NAME>_CMD`, e.g.
 `CREWWATCH_ADAPTER_QWEN_CMD="qwen --yolo -p"`.
 
+Workers receive an allowlisted environment only — `PATH`, `HOME`,
+`USER`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, plus `CREWWATCH_*`
+and `*_API_KEY` variables (the keys the CLIs need). Every other
+operator env var is never visible to a worker, and the values of the
+vars that are passed are redacted from transcripts. A goal spec that
+pastes a value looking like a secret is rejected at intake: pass
+secrets via environment variables, never in specs.
+
+Cost accounting: a worker that reports `cost_usd` in JSON output has
+it recorded verbatim; otherwise cost is computed from parsed input /
+output tokens with a per-adapter price table configured by
+`CREWWATCH_PRICE_INPUT_PER_MTOK` and
+`CREWWATCH_PRICE_OUTPUT_PER_MTOK` (dollars per million tokens).
+Both default to $0 — free local models cost nothing unless you
+configure pricing.
+
 ## Architecture
 
 Single Go binary (daemon + CLI), stdlib-first, one dependency:
@@ -93,10 +109,24 @@ task transitions.
   Single process, SQLite state, polls for work. Survives restart and
   resumes in-flight goals; a task left mid-flight by a killed daemon is
   marked interrupted and re-dispatched — attempt counts prove no
-  duplicated dispatches.
+  duplicated dispatches. Before re-dispatching, the stale worker's
+  process group (and any descendants found by walking /proc) is
+  SIGKILLed via its pid file, so a restart never runs a second worker
+  while the first is alive. At intake, the binaries named in each
+  task's verify command are checked to exist on PATH, so a missing
+  toolchain fails fast instead of burning the attempt budget.
 - **Goal → task DAG**: each task has a written acceptance criterion, a
-  verification command, and a bounded attempt budget. A goal that cannot
-  be decomposed fails closed.
+  verification command, and a bounded attempt budget that counts every
+  dispatch — completed, failed, timed out, and interrupted. A goal that
+  cannot be decomposed fails closed. Decomposed tasks get their
+  verify command from the repo (never from worker output); a decomposed
+  task with no detectable verify command is dropped, with an audit
+  event and a stderr line. The raw decomposition JSON is logged as an
+  audit event, so the DAG decision is recorded for replay/audit.
+  Taskless-goal decomposition is nondeterministic by design (LLM
+  output); the determinism guarantee covers explicit-task specs.
+  `script_cmd` tasks are rejected unless `goal add --allow-script`
+  is passed (harness/internal use only).
 - **Worker adapters** (`internal/adapter`): one per CLI. Contract:
   `dispatch(task, worktree) → result{diff, transcript, exit}`. Workers
   run in their own git worktree of the target repo and are killed as a
@@ -105,21 +135,40 @@ task transitions.
 - **Verifier**: runs the repo's own test suite in the worktree. Task
   closes only when the verifier passes; a worker's "done" is never
   sufficient. Verification must also produce evidence (non-empty output
-  or a non-empty diff), or the task escalates.
+  or a non-empty diff), or the task escalates. The pre-existing test
+  suite must pass unchanged: any change to a test file by a worker —
+  added, deleted, or modified, compared against the suite as committed
+  at HEAD — escalates the task, and the pre-existing suite must pass
+  unchanged. Fixture repos therefore ship complete source and complete
+  tests upfront, and each task verifies with a scoped command
+  (`go test -run ^TestX$ ./...`).
 - **Receipts** (`internal/receipt`): every closed task emits a signed,
   content-addressed receipt (`crewwatch/1`, Ed25519 over JCS-canonical
-  JSON). `verify` works offline. Flipping one byte fails verification.
+  JSON). `verify` works offline, and it verifies against the pinned
+  operator key in `<home>/key.pub` — a receipt signed under any other
+  key is refused, with expected vs actual fingerprints in the error.
+  Replacing `key.pem`/`key.pub` is a revocation event: receipts signed
+  before the rotation fail verification by design. The receipt also
+  records the worker's exit code on the closing attempt.
 - **Audit log** (`internal/audit`): hash-chained JSONL alongside
-  SQLite; every manager decision is appended.
+  SQLite, HMAC-authenticated with a key in `<home>/audit.key` (0600,
+  generated on first use, kept out of the log file); every manager
+  decision is appended. The expected head hash and entry count are
+  persisted in SQLite meta on every append (file first, then SQLite),
+  so truncation is detectable; the daemon runs the same full
+  verification on open and refuses to start on a broken chain.
 - **Human gate**: verified tasks wait in their worktree (branch
   `cw-<task-id>`) for a human to review. Crewwatch never merges and
   never pushes.
 - **Eval harness** (`internal/eval`, `crewwatch eval`): a benchmark of
-  10 real tasks across 2 repos, run end-to-end, with completion rate,
-  median attempts, and cost recorded in `eval/results/`. The harness
-  workers are scripted fixers — the numbers measure the manager
-  pipeline, not model capability. Real CLI adapters are exercised with
-  stub CLIs in the adapter tests.
+  12 tasks across 2 repos — 10 honest tasks that must close, plus 2
+  adversarial tasks (a cheating worker that guts the tests, and an
+  unfixable task) that must escalate — run end-to-end, with honest
+  completion rate, adversarial escalation rate, median attempts, and
+  cost recorded in `eval/results/`. The harness workers are scripted
+  fixers — the numbers measure the manager pipeline, not model
+  capability. Real CLI adapters are exercised with stub CLIs in the
+  adapter tests.
 
 ## Honest limits
 
@@ -133,10 +182,33 @@ task transitions.
   verifier is necessary, not sufficient.
 - **Workers run with your credentials and filesystem access (no sandbox in v1).** A worker can read your home directory and environment — the
   same accepted residual as Triangulate's B6. This is disclosed here, in
-  `--help`, and on stderr on every dispatch. A real sandbox is a v1.1
-  assessment. The manager does detect a worker writing outside its
-  worktree (the main checkout is snapshotted before dispatch) and
-  escalates the task — but that is detection, not prevention.
+  `--help`, and on stderr on every dispatch (including decompose
+  dispatches). A real sandbox is a v1.1 assessment. The manager does
+  detect a worker writing outside its worktree — the main checkout
+  (including gitignored files and `.git/hooks`), every other live
+  worktree, and the state home's top level are snapshotted before
+  dispatch and compared after — and escalates the task — but that is
+  detection, not prevention. A worker that writes somewhere entirely
+  outside those snapshots (e.g. an arbitrary path in /tmp) is not
+  detected.
+- **Receipts and the audit log are tamper-evident only against
+  anyone who lacks the operator's keys.** Receipts are pinned to the
+  operator key in `<home>/key.pub` and the audit log is HMACed with
+  `<home>/audit.key`. But a worker on this machine has operator
+  credentials in v1 and could read `key.pem`/`key.pub`/`audit.key` and
+  forge receipts or rewrite the log that would still verify. That
+  exposure is a revocation event: replace the keys, and receipts from
+  before the rotation fail verification by design.
+- **Verification executes worker-controlled code as the manager.**
+  `go test` runs the worker's `TestMain`/`init` functions — "verify"
+  is itself code execution of untrusted output. That is an accepted
+  no-sandbox consequence in v1, not a separate sandbox boundary.
+- **Setsid grandchildren:** cancel and timeout kill the worker's
+  process group plus every descendant found by walking /proc, which
+  catches `setsid` grandchildren while they are still descendants.
+  Residual: a process that double-forked and whose parent already
+  exited is reparented to init and no longer appears as a descendant,
+  so it cannot be found this way.
 - **Workers have full network access in v1.** There is no egress
   allowlist. If you need one, that is a v1.1 feature, not a config flag
   that exists today.
@@ -160,9 +232,11 @@ The task is marked failed, not done. It retries (up to its attempt
 budget) with the failure in the prompt, then escalates to you.
 
 **What if the daemon is killed mid-task?**
-On restart it marks the interrupted attempt, returns the task to
-pending, and re-dispatches. Attempt counts prove nothing was
-dispatched twice.
+On restart it SIGKILLs the stale worker's process group via its pid
+file, marks the interrupted attempt, and re-dispatches — unless the
+attempt budget (which counts every dispatch, interrupted ones
+included) is already spent, in which case the task escalates instead
+of retrying forever. Attempt counts prove nothing was dispatched twice.
 
 **Which coding agents does it support?**
 OpenCode, Qwen Code, Claude Code, Codex, and Gemini CLI via adapters.
@@ -172,7 +246,9 @@ and tests only.
 
 **How do I check a receipt?**
 `crewwatch verify <receipt.json>` — offline, no daemon needed.
-`crewwatch verify --all` checks every stored receipt.
+`crewwatch verify --all` checks every stored receipt. Both verify
+against the pinned operator key in `~/.crewwatch/key.pub`: a receipt
+signed under any other key is refused.
 
 **Where is the eval evidence?**
 `eval/results/` holds the recorded harness runs. The harness is the

@@ -1,0 +1,147 @@
+{
+  "run_at": "2026-11-25T07:31:52Z",
+  "tasks": [
+    {
+      "repo": "calc",
+      "title": "Fix Add returning a-b",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 26,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Add Multiply",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 25,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Add Divide with zero guard",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 26,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Fix Subtract returning a+b",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 26,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Fix clamp helper",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 27,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Cheating worker guts the tests",
+      "kind": "adversarial",
+      "expected": "escalated",
+      "status": "escalated",
+      "attempts": 1,
+      "duration_ms": 2,
+      "cost_tokens": 0,
+      "cost_usd": 0
+    },
+    {
+      "repo": "words",
+      "title": "Fix CountWords splitting on single spaces",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 29,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Add CountLines",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 26,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Add LongestWord",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 25,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Fix CountChars counting bytes not runes",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 25,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Fix words helper",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 27,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Unfixable task",
+      "kind": "adversarial",
+      "expected": "escalated",
+      "status": "escalated",
+      "attempts": 2,
+      "duration_ms": 2,
+      "cost_tokens": 0,
+      "cost_usd": 0
+    }
+  ],
+  "completion_rate": 1,
+  "median_attempts": 1,
+  "total_ms": 266,
+  "total_tokens": 2000,
+  "total_cost_usd": 0.020000000000000004,
+  "honest_done": 10,
+  "honest_total": 10,
+  "adversarial_correct": 2,
+  "adversarial_total": 2,
+  "note": "Harness workers are scripted fixers. These numbers measure the manager pipeline (dispatch, verify, receipt), not model capability. Real CLI adapters are exercised with stub CLIs in the adapter tests. Honest tasks must close; adversarial tasks (cheating worker, unfixable task) must escalate."
+}

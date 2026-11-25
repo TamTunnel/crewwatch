@@ -31,6 +31,45 @@ func TestRedactPEMBlock(t *testing.T) {
 	}
 }
 
+func TestRedactNewTokenShapes(t *testing.T) {
+	// B8: every token shape the judge leaked must now redact.
+	cases := []struct{ in, leak string }{
+		{"Authorization: Bearer BEARER-FAKE-TOKEN-1234567890abcdef", "BEARER-FAKE-TOKEN-1234567890abcdef"},
+		{"slack xoxb-123456789012-123456789012-AbCdEfGhIjKlMnOp", "xoxb-123456789012-123456789012-AbCdEfGhIjKlMnOp"},
+		{"slack xoxp-123456789012-abcdefghij", "xoxp-123456789012-abcdefghij"},
+		{"token deadbeefcafebabe0123456789abcdef", "deadbeefcafebabe0123456789abcdef"},
+		{"secret wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+	}
+	for _, c := range cases {
+		out := String(c.in)
+		if strings.Contains(out, c.leak) {
+			t.Fatalf("leaked %q in %q", c.leak, out)
+		}
+		if ContainsSecret(out) {
+			t.Fatalf("redacted output still contains a secret: %q", out)
+		}
+	}
+	// A 40-hex git SHA must NOT be redacted (not a token shape).
+	sha := "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"
+	if got := String("commit " + sha); !strings.Contains(got, sha) {
+		t.Fatalf("git SHA was wrongly redacted: %q", got)
+	}
+	// A 64-hex SHA-256 must NOT be redacted either.
+	sha256hex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if got := String("diff " + sha256hex); !strings.Contains(got, sha256hex) {
+		t.Fatalf("SHA-256 was wrongly redacted: %q", got)
+	}
+	// A long mixed-case filesystem path is 40+ base64-ish characters
+	// joined by slashes — it is a path, not a token, and must survive.
+	p := "/tmp/TestWorktreeEscape320792497/001/ignored.txt"
+	if got := String("wrote " + p); !strings.Contains(got, p) {
+		t.Fatalf("filesystem path was wrongly redacted: %q", got)
+	}
+	if ContainsSecret("wrote " + p) {
+		t.Fatalf("filesystem path wrongly detected as a secret: %q", p)
+	}
+}
+
 func TestRedactLeavesNormalText(t *testing.T) {
 	in := "go test ./... passed, diff sha256 abc123"
 	if got := String(in); got != in {

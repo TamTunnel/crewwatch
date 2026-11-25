@@ -68,7 +68,7 @@ s = open(p).read().replace("return a - b", "return a + b")
 open(p, "w").write(s)
 EOF`
 	spec := Spec{
-		Title: "fix Add", Repo: repo, Adapter: "script",
+		Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "fix Add", Acceptance: "Add returns a+b", VerifyCmd: "go test ./...", ScriptCmd: slowFix, MaxAttempts: 3}},
 	}
 	raw, _ := json.Marshal(spec)
@@ -76,7 +76,7 @@ EOF`
 	if err := os.WriteFile(specFile, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out := runBin(t, home, bin, "goal", "add", "--spec", specFile)
+	out := runBin(t, home, bin, "goal", "add", "--spec", specFile, "--allow-script")
 	goalID := strings.Fields(out)[1]
 
 	// Start the daemon, wait until the worker is dispatched, then kill -9.
@@ -157,7 +157,7 @@ s = open(p).read().replace("return a - b", "return a + b")
 open(p, "w").write(s)
 EOF`
 	spec := Spec{
-		Title: "slow goal", Repo: repo, Adapter: "script",
+		Title: "slow goal", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "slow task", Acceptance: "fix", VerifyCmd: "go test ./...", ScriptCmd: slow, MaxAttempts: 3}},
 	}
 	raw, _ := json.Marshal(spec)
@@ -165,7 +165,7 @@ EOF`
 	if err := os.WriteFile(specFile, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out := runBin(t, home, bin, "goal", "add", "--spec", specFile)
+	out := runBin(t, home, bin, "goal", "add", "--spec", specFile, "--allow-script")
 	goalID := strings.Fields(out)[1]
 
 	daemon := exec.Command(bin, "daemon")

@@ -29,7 +29,10 @@ const helpText = `crewwatch — persistent manager agent for engineering goals.
 
 Usage:
   crewwatch daemon [--home DIR] [--once]   run the manager daemon
-  crewwatch goal add --spec FILE           add a goal from a JSON spec
+  crewwatch goal add --spec FILE [--allow-script]
+                                 add a goal from a JSON spec
+                                 (--allow-script permits script_cmd tasks;
+                                 harness/internal use only)
   crewwatch goal list                      list goals
   crewwatch goal cancel <goal-id>          stop a goal, kill its workers
   crewwatch status [goal-id]               show goals, tasks, attempts
@@ -159,14 +162,18 @@ func cmdGoal(home string, args []string) error {
 	switch args[0] {
 	case "add":
 		var specFile string
+		allowScript := false
 		for i := 1; i < len(args); i++ {
 			if args[i] == "--spec" && i+1 < len(args) {
 				specFile = args[i+1]
 				i++
 			}
+			if args[i] == "--allow-script" {
+				allowScript = true
+			}
 		}
 		if specFile == "" {
-			return fmt.Errorf("usage: crewwatch goal add --spec FILE")
+			return fmt.Errorf("usage: crewwatch goal add --spec FILE [--allow-script]")
 		}
 		raw, err := os.ReadFile(specFile)
 		if err != nil {
@@ -176,6 +183,9 @@ func cmdGoal(home string, args []string) error {
 		if err := json.Unmarshal(raw, &spec); err != nil {
 			return fmt.Errorf("bad spec %s: %w", specFile, err)
 		}
+		// --allow-script is the only way to permit script_cmd tasks
+		// (harness/internal use); a spec file alone can never set it.
+		spec.AllowScript = allowScript
 		mgr, err := openManager(home)
 		if err != nil {
 			return err
@@ -271,7 +281,13 @@ func cmdStatus(home string, args []string) error {
 			for _, r := range receipts {
 				var rec receipt.Receipt
 				if err := json.Unmarshal([]byte(r), &rec); err == nil {
-					fmt.Printf("    receipt %s (verified)\n", rec.Payload.ReceiptID)
+					// The label is earned: verify against the pinned
+					// operator key on display (S5).
+					if err := receipt.VerifyPinned(&rec, mgr.PinnedKey()); err != nil {
+						fmt.Printf("    receipt %s (INVALID: %v)\n", rec.Payload.ReceiptID, err)
+					} else {
+						fmt.Printf("    receipt %s (verified)\n", rec.Payload.ReceiptID)
+					}
 				}
 			}
 		}
@@ -280,6 +296,13 @@ func cmdStatus(home string, args []string) error {
 }
 
 func cmdVerify(home string, args []string) error {
+	// All verification is against the pinned operator key: a receipt
+	// signed under any other key is refused (B1). The pinned key
+	// lives in <home>/key.pub; replacing it is a revocation event.
+	pinned, err := receipt.LoadPinnedPublicKey(home)
+	if err != nil {
+		return fmt.Errorf("no pinned operator key in %s: %w (run a daemon once to create one, or copy key.pub from the operator's home)", home, err)
+	}
 	if len(args) > 0 && args[0] == "--all" {
 		mgr, err := openManager(home)
 		if err != nil {
@@ -302,7 +325,7 @@ func cmdVerify(home string, args []string) error {
 				bad++
 				continue
 			}
-			if err := receipt.Verify(&r); err != nil {
+			if err := receipt.VerifyPinned(&r, pinned); err != nil {
 				fmt.Printf("INVALID %s: %v\n", r.Payload.ReceiptID, err)
 				bad++
 			} else {
@@ -326,7 +349,7 @@ func cmdVerify(home string, args []string) error {
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return fmt.Errorf("bad receipt file: %w", err)
 	}
-	if err := receipt.Verify(&r); err != nil {
+	if err := receipt.VerifyPinned(&r, pinned); err != nil {
 		return fmt.Errorf("INVALID: %w", err)
 	}
 	fmt.Printf("VALID %s\n  task: %s (%s)\n  worker: %s, attempts: %d, diff: %s\n",
@@ -339,7 +362,21 @@ func cmdAudit(home string, args []string) error {
 	if len(args) == 0 || args[0] != "verify" {
 		return fmt.Errorf("usage: crewwatch audit verify")
 	}
-	if err := audit.Verify(filepath.Join(home, "audit.jsonl")); err != nil {
+	key, err := audit.LoadOrCreateKey(home)
+	if err != nil {
+		return err
+	}
+	// The truncation anchor lives in SQLite meta; open the store
+	// read-only in effect (Open creates it only if it does not exist,
+	// which for a real home it does).
+	mgr, err := openManager(home)
+	if err != nil {
+		return err
+	}
+	defer mgr.Close()
+	head, _ := mgr.Store.GetMeta("audit_head")
+	count, _ := mgr.Store.GetMeta("audit_count")
+	if err := audit.Verify(filepath.Join(home, "audit.jsonl"), key, head, audit.ParseCount(count)); err != nil {
 		return fmt.Errorf("audit log INVALID: %w", err)
 	}
 	fmt.Println("audit log valid")
@@ -369,19 +406,14 @@ func cmdEval(home string, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("eval complete: %d/%d tasks done (%.0f%%)\n", countDone(res), len(res.Tasks), res.CompletionRate*100)
-	fmt.Printf("median attempts: %.1f, total tokens: %d, total time: %dms\n", res.MedianAttempts, res.TotalTokens, res.TotalMs)
+	fmt.Printf("eval complete: honest %d/%d tasks done (%.0f%%)\n", res.HonestDone, res.HonestTotal, res.CompletionRate*100)
+	fmt.Printf("adversarial: %d/%d correctly escalated\n", res.AdversarialCorrect, res.AdversarialTotal)
+	fmt.Printf("median attempts: %.1f, total tokens: %d, total cost: $%.4f, total time: %dms\n", res.MedianAttempts, res.TotalTokens, res.TotalCostUSD, res.TotalMs)
 	fmt.Printf("results: %s\n", path)
 	fmt.Printf("note: %s\n", res.Note)
 	return nil
 }
 
 func countDone(res *eval.Result) int {
-	n := 0
-	for _, t := range res.Tasks {
-		if t.Status == state.TaskDone {
-			n++
-		}
-	}
-	return n
+	return res.HonestDone
 }

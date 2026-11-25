@@ -130,6 +130,8 @@ func (s *Store) migrate() error {
 	CREATE TABLE IF NOT EXISTS adapters(
 		name TEXT PRIMARY KEY, cli TEXT NOT NULL, args_json TEXT NOT NULL DEFAULT '[]',
 		capabilities_json TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1);
+	CREATE TABLE IF NOT EXISTS meta(
+		key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
 	CREATE INDEX IF NOT EXISTS idx_tasks_goal ON tasks(goal_id, status);
 	CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, started_at);
 	`)
@@ -288,6 +290,32 @@ func (s *Store) CountAttempts(taskID, status string) (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE task_id=? AND status=?`, taskID, status).Scan(&n)
 	return n, err
+}
+
+// CountAllAttempts returns the total number of dispatches for a task,
+// regardless of how they ended (completed, failed, timed out, or
+// interrupted). The attempt budget counts every dispatch.
+func (s *Store) CountAllAttempts(taskID string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE task_id=?`, taskID).Scan(&n)
+	return n, err
+}
+
+// SetMeta stores a key/value pair in the meta table.
+func (s *Store) SetMeta(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO meta(key,value) VALUES(?,?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	return err
+}
+
+// GetMeta returns the value for key, or "" if unset.
+func (s *Store) GetMeta(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
 }
 
 // --- attempts ---

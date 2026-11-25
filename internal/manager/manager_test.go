@@ -44,9 +44,16 @@ func makeRepo(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-// auditVerify checks the manager's audit log.
+// auditVerify checks the manager's audit log, including the HMAC and
+// the SQLite truncation anchor.
 func auditVerify(mgr *Manager) error {
-	return audit.Verify(filepath.Join(mgr.Home, "audit.jsonl"))
+	key, err := audit.LoadOrCreateKey(mgr.Home)
+	if err != nil {
+		return err
+	}
+	head, _ := mgr.Store.GetMeta("audit_head")
+	count, _ := mgr.Store.GetMeta("audit_count")
+	return audit.Verify(filepath.Join(mgr.Home, "audit.jsonl"), key, head, audit.ParseCount(count))
 }
 
 func newTestManager(t *testing.T) *Manager {
@@ -88,9 +95,10 @@ func TestHappyPath(t *testing.T) {
 p = "calc.go"
 s = open(p).read().replace("return a - b", "return a + b")
 open(p, "w").write(s)
-EOF`
+EOF
+echo '{"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.0015}'`
 	g, err := mgr.AddGoal(&Spec{
-		Title: "fix Add", Repo: repo, Adapter: "script",
+		Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "fix Add", Acceptance: "Add returns a+b", VerifyCmd: "go test ./...", ScriptCmd: fix, MaxAttempts: 3}},
 	})
 	if err != nil {
@@ -123,14 +131,25 @@ EOF`
 	if r.Payload.Format != "crewwatch/1" {
 		t.Fatalf("receipt format %q", r.Payload.Format)
 	}
-	// Cost accounting reconciles against the transcript (probe 7).
+	// Cost accounting reconciles against the transcript (probe 7):
+	// tokens and cost are hand-computed from the token JSON the
+	// worker emitted (100 in + 50 out, cost_usd 0.0015).
 	atts, _ := mgr.Store.AttemptsForTask(tasks[0].ID)
 	if len(atts) != 1 {
 		t.Fatalf("attempts %d, want 1", len(atts))
 	}
+	if atts[0].CostTokens != 150 {
+		t.Fatalf("tokens %d, want 150 (100 in + 50 out)", atts[0].CostTokens)
+	}
+	if atts[0].CostUSD != 0.0015 {
+		t.Fatalf("cost %v, want 0.0015", atts[0].CostUSD)
+	}
 	raw, err := os.ReadFile(atts[0].TranscriptRef)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"input_tokens": 100`) || !strings.Contains(string(raw), `"cost_usd": 0.0015`) {
+		t.Fatalf("transcript lacks the token/cost JSON it reconciles against: %q", string(raw))
 	}
 	footer := fmt.Sprintf("duration_ms=%d", atts[0].DurationMs)
 	if !strings.Contains(string(raw), footer) {
@@ -148,7 +167,7 @@ func TestDecomposeOrFail(t *testing.T) {
 	mgr := newTestManager(t)
 	repo := makeRepo(t, map[string]string{"go.mod": "module x\n\ngo 1.25.0\n"})
 	g, err := mgr.AddGoal(&Spec{
-		Title: "make it better", Repo: repo, Adapter: "script",
+		Title: "make it better", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: nil, // no tasks: must decompose or fail closed
 	})
 	if err != nil {
@@ -180,7 +199,7 @@ s = open(p).read().replace("return a - b", "return a + b")
 open(p, "w").write(s)
 EOF`, repo)
 	g, err := mgr.AddGoal(&Spec{
-		Title: "fix Add", Repo: repo, Adapter: "script",
+		Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "fix Add", Acceptance: "Add returns a+b", VerifyCmd: "go test ./...", ScriptCmd: escape, MaxAttempts: 1}},
 	})
 	if err != nil {
@@ -207,7 +226,7 @@ func TestVerifierIsKing(t *testing.T) {
 	repo := makeRepo(t, map[string]string{"go.mod": "module calc\n\ngo 1.25.0\n", "calc.go": calcGo, "calc_test.go": calcTest})
 	liar := `echo "done! all fixed, trust me" && true`
 	g, err := mgr.AddGoal(&Spec{
-		Title: "fix Add", Repo: repo, Adapter: "script",
+		Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "fix Add", Acceptance: "Add returns a+b", VerifyCmd: "go test ./...", ScriptCmd: liar, MaxAttempts: 2}},
 	})
 	if err != nil {
@@ -234,7 +253,7 @@ func TestBoundedRepair(t *testing.T) {
 	mgr := newTestManager(t)
 	repo := makeRepo(t, map[string]string{"go.mod": "module calc\n\ngo 1.25.0\n", "calc.go": calcGo, "calc_test.go": calcTest})
 	g, err := mgr.AddGoal(&Spec{
-		Title: "unfixable", Repo: repo, Adapter: "script",
+		Title: "unfixable", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "impossible", Acceptance: "cannot be done", VerifyCmd: "go test ./...", ScriptCmd: "exit 1", MaxAttempts: 2}},
 	})
 	if err != nil {
@@ -247,40 +266,79 @@ func TestBoundedRepair(t *testing.T) {
 	}
 }
 
-// TestSecretRedaction is probe 10: a canary secret in the worker's output
-// never appears in transcripts, receipts, or the audit trail.
+// TestSecretRedaction is probe 10: a canary secret in the worker's
+// environment never appears anywhere under the state dir (transcripts,
+// receipts, audit log, AND the SQLite DB), and a spec that pastes a
+// secret in is rejected at intake with an error telling the operator
+// to use env vars instead.
 func TestSecretRedaction(t *testing.T) {
 	t.Setenv("CREWWATCH_CANARY", "CANARY-SECRET-987")
+	t.Setenv("TEST_API_KEY", "tok-live-9f8e7d6c5b4a3f2e1d0c")
+	// The remaining token shapes reach the worker the same way — via
+	// env vars, never pasted into the spec (which AddGoal rejects).
+	t.Setenv("BEARER_API_KEY", "BEARER-FAKE-TOKEN-1234567890abcdef")
+	t.Setenv("SLACK_API_KEY", "xoxb-123456789012-abcdef")
+	t.Setenv("AWS_API_KEY", "AKIAIOSFODNN7EXAMPLE")
 	mgr := newTestManager(t)
 	repo := makeRepo(t, map[string]string{"go.mod": "module calc\n\ngo 1.25.0\n", "calc.go": calcGo, "calc_test.go": calcTest})
-	leaky := `echo "my key is AKIAIOSFODNN7EXAMPLE and CANARY-SECRET-987"
+
+	// (a) AddGoal rejects a spec containing a secret, in the title or
+	// in a script, with an error pointing at env vars.
+	for _, bad := range []*Spec{
+		{Title: "fix AKIAIOSFODNN7EXAMPLE", Repo: repo, Adapter: "script", AllowScript: true,
+			Tasks: []TaskSpec{{Title: "x", VerifyCmd: "go test ./...", ScriptCmd: "true", MaxAttempts: 1}}},
+		{Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
+			Tasks: []TaskSpec{{Title: "x", VerifyCmd: "go test ./...", ScriptCmd: `echo AKIAIOSFODNN7EXAMPLE`, MaxAttempts: 1}}},
+	} {
+		if _, err := mgr.AddGoal(bad); err == nil {
+			t.Fatalf("AddGoal accepted a spec containing a secret: %+v", bad)
+		} else if !strings.Contains(err.Error(), "environment variables") {
+			t.Fatalf("rejection must tell the operator to use env vars, got: %v", err)
+		}
+	}
+
+	// (b) Secrets that reach the worker via its (allowlisted)
+	// environment and are echoed into output must be redacted from
+	// everything stored — including the SQLite DB file.
+	leaky := `echo "my key is $TEST_API_KEY and $CREWWATCH_CANARY and Bearer $BEARER_API_KEY and $SLACK_API_KEY and $AWS_API_KEY"
 python3 - <<'EOF'
 p = "calc.go"
 s = open(p).read().replace("return a - b", "return a + b")
 open(p, "w").write(s)
 EOF`
 	_, err := mgr.AddGoal(&Spec{
-		Title: "fix Add", Repo: repo, Adapter: "script",
+		Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{{Title: "fix Add", Acceptance: "Add returns a+b", VerifyCmd: "go test ./...", ScriptCmd: leaky, MaxAttempts: 3}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	runIdle(t, mgr)
-	// Grep every text artifact the manager wrote.
-	for _, dir := range []string{"transcripts", "receipts"} {
-		entries, _ := os.ReadDir(filepath.Join(mgr.Home, dir))
-		for _, e := range entries {
-			raw, _ := os.ReadFile(filepath.Join(mgr.Home, dir, e.Name()))
-			if redact.ContainsSecret(string(raw)) {
-				t.Fatalf("secret leaked into %s/%s", dir, e.Name())
+	// Grep the WHOLE state dir, including the SQLite DB file, for
+	// every secret value the worker could have leaked.
+	secrets := []string{
+		"CANARY-SECRET-987", "tok-live-9f8e7d6c5b4a3f2e1d0c",
+		"BEARER-FAKE-TOKEN-1234567890abcdef", "xoxb-123456789012-abcdef",
+		"AKIAIOSFODNN7EXAMPLE",
+	}
+	_ = filepath.Walk(mgr.Home, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		for _, s := range secrets {
+			if strings.Contains(string(raw), s) {
+				t.Errorf("secret %q leaked into %s", s, path)
 			}
 		}
-	}
-	raw, _ := os.ReadFile(filepath.Join(mgr.Home, "audit.jsonl"))
-	if redact.ContainsSecret(string(raw)) {
-		t.Fatal("secret leaked into audit log")
-	}
+		if redact.ContainsSecret(string(raw)) {
+			t.Errorf("secret pattern in %s", path)
+		}
+		return nil
+	})
 }
 
 // TestConcurrentGoals is probe 11: two goals in flight do not interleave
@@ -297,7 +355,7 @@ EOF`
 	var ids []string
 	for _, repo := range []string{repo1, repo2} {
 		g, err := mgr.AddGoal(&Spec{
-			Title: "fix Add", Repo: repo, Adapter: "script",
+			Title: "fix Add", Repo: repo, Adapter: "script", AllowScript: true,
 			Tasks: []TaskSpec{{Title: "fix Add", Acceptance: "Add returns a+b", VerifyCmd: "go test ./...", ScriptCmd: fix, MaxAttempts: 3}},
 		})
 		if err != nil {
@@ -326,7 +384,7 @@ func TestDeterministicReplay(t *testing.T) {
 	mgr := newTestManager(t)
 	repo := makeRepo(t, map[string]string{"go.mod": "module calc\n\ngo 1.25.0\n", "calc.go": calcGo, "calc_test.go": calcTest})
 	spec := &Spec{
-		Title: "fix things", Repo: repo, Adapter: "script",
+		Title: "fix things", Repo: repo, Adapter: "script", AllowScript: true,
 		Tasks: []TaskSpec{
 			{Title: "first", Acceptance: "a", VerifyCmd: "go test ./...", ScriptCmd: "true", MaxAttempts: 1},
 			{Title: "second", Acceptance: "b", VerifyCmd: "go test ./...", ScriptCmd: "true", MaxAttempts: 1},
