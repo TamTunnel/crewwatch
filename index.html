@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crewwatch — a manager agent that owns the goal until the tests pass</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 0 auto; padding: 2rem 1.25rem; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+  h2 { margin-top: 2rem; }
+  .tagline { font-size: 1.15rem; color: #444; }
+  video { width: 100%; border: 1px solid #ccc; border-radius: 8px; }
+  code { background: #f0f0f0; padding: 0.1em 0.35em; border-radius: 4px; }
+  pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: .85em; }
+  pre code { background: none; padding: 0; }
+  details pre { max-height: 480px; overflow: auto; }
+  .note { background: #fff8e1; border-left: 4px solid #e6a200; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .limits { background: #f7f7f7; border-left: 4px solid #888; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .step { background: #f8f9fa; border-left: 4px solid #2a7ae2; padding: 1rem 1.2rem; margin: 1.2rem 0; border-radius: 0 6px 6px 0; }
+  ol li, ul li { margin-bottom: 0.35rem; }
+  a { color: #0b5fff; }
+  .small { color: #555; font-size: .9em; }
+  table { border-collapse: collapse; width: 100%; font-size: .9em; }
+  th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
+  th { background: #f4f4f4; }
+</style>
+</head>
+<body>
+<h1>Crewwatch</h1>
+<p class="tagline">A persistent manager agent that owns an engineering goal end-to-end on free local coding agents — and proves what it did. It breaks a goal into tasks, dispatches each to a coding agent on your own machine, and closes a task only when the repo's own tests pass. Every finished task gets a signed receipt. It never merges anything itself.</p>
+
+<p><a href="https://github.com/TamTunnel/crewwatch">Repository on GitHub</a> · Apache-2.0 · Go stdlib-first single binary · SQLite state</p>
+
+<h2 id="video">Demo video</h2>
+<p>A real run of the built binary — a goal worked to completion with a signed receipt, then the eval harness:</p>
+<video controls preload="metadata" src="crewwatch-explainer.mp4">
+  Your browser does not support the video tag. <a href="crewwatch-explainer.mp4">Download the video</a>.
+</video>
+<div class="note"><strong>About this demo:</strong> both runs are the real <code>crewwatch</code> binary (commit <code>95be81b</code>), run on 2026-11-25 against throwaway fixture repos. The goal smoke used the <code>script</code> adapter — a scripted fixer standing in for a real coding-agent CLI, because no model credentials exist in this environment — and the eval harness workers are likewise scripted fixers. The manager pipeline they went through (dispatch, worktree isolation, verification, receipt signing, audit log) is the real one. The eval numbers below measure that pipeline, not model capability.</div>
+
+<h2>The goal — fixed, verified, receipted</h2>
+<p>Goal <code>goal-38cff426c1f4</code>, “Fix the Add bug in calc”, one task, script adapter, <code>go test ./...</code> as the verifier:</p>
+<pre><code>goal goal-38cff426c1f4 [done] Fix the Add bug in calc
+  task task-b7f4a00d5d64 [done] Fix Add returning a-b (adapter script, 1/3 attempts)
+    worktree: /tmp/demo-capture/home2/worktrees/task-b7f4a00d5d64 (branch cw-task-b7f4a00d5d64)
+    attempt attempt-43a63bca1336 [completed] exit=0 dur=33ms tokens=0
+    receipt f04dac4f8f90eb2bf0d18bf944dcc869fd0154db07d4cc4a89f85c1901f13c9e (verified)</code></pre>
+<p>Verification of that receipt, offline against the pinned operator key:</p>
+<pre><code>$ crewwatch verify --all
+VALID f04dac4f8f90eb2bf0d18bf944dcc869fd0154db07d4cc4a89f85c1901f13c9e (task task-b7f4a00d5d64)
+all 1 receipts valid
+
+$ crewwatch audit verify
+audit log valid</code></pre>
+<p>The fix waited in its own worktree branch (<code>cw-task-b7f4a00d5d64</code>) for a human to review; the main checkout was untouched. Crewwatch never merges and never pushes.</p>
+
+<h2>The eval harness — 10 honest + 2 adversarial tasks, 2026-11-25</h2>
+<p>Run: <code>crewwatch eval</code>, 2026-11-25T07:56:22Z. <strong>Honest 10/10 done, adversarial 2/2 correctly escalated, median attempts 1.0, 2000 tokens, $0.02, 284ms.</strong></p>
+<table>
+<tr><th>Repo</th><th>Task</th><th>Kind</th><th>Result</th><th>Attempts</th></tr>
+<tr><td>calc</td><td>Fix Add returning a-b</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>calc</td><td>Add Multiply</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>calc</td><td>Add Divide with zero guard</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>calc</td><td>Fix Subtract returning a+b</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>calc</td><td>Fix clamp helper</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>calc</td><td>Cheating worker guts the tests</td><td>adversarial</td><td>escalated</td><td>1</td></tr>
+<tr><td>words</td><td>Fix CountWords splitting on single spaces</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>words</td><td>Add CountLines</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>words</td><td>Add LongestWord</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>words</td><td>Fix CountChars counting bytes not runes</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>words</td><td>Fix words helper</td><td>honest</td><td>done</td><td>1</td></tr>
+<tr><td>words</td><td>Unfixable task</td><td>adversarial</td><td>escalated</td><td>2</td></tr>
+</table>
+<p>The cheating worker deleted the test file and wrote an empty test — the task escalated with no receipt, and the bug stayed in the main checkout. The unfixable task hit its attempt budget and escalated instead of looping forever.</p>
+
+<h2>What makes it different</h2>
+<ul>
+  <li><strong>Verification-first closing.</strong> A task closes only when the repo's own tests pass in the worker's worktree. A worker's claim of “done” is never sufficient — test-gutting escalates, it doesn't ship.</li>
+  <li><strong>The eval harness is the product.</strong> A benchmark of real engineering tasks across two repos, run on every release, with completion rate, attempts, and cost recorded — not claimed. The full results JSON for this run is below.</li>
+  <li><strong>Signed receipts, not chat transcripts.</strong> Every closed task emits an Ed25519-signed, content-addressed <code>crewwatch/1</code> receipt — what was done, which worker, how many attempts, what it cost — verifiable offline with <code>crewwatch verify</code>.</li>
+  <li><strong>Worktree isolation.</strong> Every worker runs in its own git worktree. Writes outside it to the main checkout, other worktrees, <code>.git/hooks</code>, or the state home are detected and escalate the task.</li>
+  <li><strong>Crash-safe by design.</strong> SQLite state, kill -9 the daemon mid-goal and it resumes with no lost tasks and no duplicated dispatches. Bounded repair: unfixable tasks escalate at their attempt budget.</li>
+  <li><strong>Human gate.</strong> Verified work waits in its worktree branch. Crewwatch never merges and never pushes — there is no code path from a verified task to a merge.</li>
+</ul>
+
+<h2>Honest limits — stated, not hidden</h2>
+<div class="limits">
+<ul>
+  <li><strong>Harness workers are scripted fixers, so the 10/10 measures the manager pipeline (dispatch, verify, receipt), not model capability.</strong> Real CLI adapters (OpenCode, Qwen Code, Claude Code, Codex, Gemini CLI) are exercised with stub CLIs in the adapter tests; no live model run has happened in this environment. Long-horizon reliability on real models is unproven — the harness exists to measure it, not hide it.</li>
+  <li><strong>Workers run with your credentials and filesystem access (no sandbox in v1).</strong> A worker can read your home directory and environment. This is disclosed in the README, in <code>--help</code>, and on stderr on every dispatch. A real sandbox is a v1.1 assessment.</li>
+  <li><strong>Escape detection covers an inventory, not the filesystem.</strong> The main checkout (including gitignored files and <code>.git/hooks</code>), every other live worktree, and the state home's top level are snapshotted before dispatch and compared after. A worker that writes somewhere entirely outside those snapshots (e.g. an arbitrary path in /tmp) is not detected — and that enables nothing beyond the already-accepted no-sandbox residual.</li>
+  <li><strong>Green tests ≠ correct.</strong> Verification via the repo's own tests only works if the repo has tests, and tests can pass on wrong code. The verifier is necessary, not sufficient.</li>
+  <li><strong>Receipts and the audit log are tamper-evident only against anyone who lacks the operator's keys.</strong> A worker on this machine has operator credentials in v1 and could read <code>key.pem</code>/<code>audit.key</code> and forge receipts or rewrite the log that would still verify. That exposure is a revocation event: replace the keys, and receipts from before the rotation fail verification by design.</li>
+  <li><strong>Verification executes worker-controlled code as the manager.</strong> <code>go test</code> runs the worker's <code>TestMain</code>/<code>init</code> functions — “verify” is itself code execution of untrusted output. An accepted no-sandbox consequence in v1, not a separate sandbox boundary.</li>
+  <li><strong>Free local models are weaker than frontier models.</strong> The cost pitch is real; the capability ceiling is lower than Devin's. The harness must show the gap honestly.</li>
+</ul>
+</div>
+
+<h2>Full eval results JSON (verbatim)</h2>
+<details>
+<summary>results-20261125-075622.json as recorded by the harness</summary>
+<pre><code>{
+  "run_at": "2026-11-25T07:56:22Z",
+  "tasks": [
+    {
+      "repo": "calc",
+      "title": "Fix Add returning a-b",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 32,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Add Multiply",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 30,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Add Divide with zero guard",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 27,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Fix Subtract returning a+b",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 26,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Fix clamp helper",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 27,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "calc",
+      "title": "Cheating worker guts the tests",
+      "kind": "adversarial",
+      "expected": "escalated",
+      "status": "escalated",
+      "attempts": 1,
+      "duration_ms": 3,
+      "cost_tokens": 0,
+      "cost_usd": 0
+    },
+    {
+      "repo": "words",
+      "title": "Fix CountWords splitting on single spaces",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 27,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Add CountLines",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 28,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Add LongestWord",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 27,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Fix CountChars counting bytes not runes",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 29,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Fix words helper",
+      "kind": "honest",
+      "expected": "done",
+      "status": "done",
+      "attempts": 1,
+      "duration_ms": 26,
+      "cost_tokens": 200,
+      "cost_usd": 0.002
+    },
+    {
+      "repo": "words",
+      "title": "Unfixable task",
+      "kind": "adversarial",
+      "expected": "escalated",
+      "status": "escalated",
+      "attempts": 2,
+      "duration_ms": 2,
+      "cost_tokens": 0,
+      "cost_usd": 0
+    }
+  ],
+  "completion_rate": 1,
+  "median_attempts": 1,
+  "total_ms": 284,
+  "total_tokens": 2000,
+  "total_cost_usd": 0.020000000000000004,
+  "honest_done": 10,
+  "honest_total": 10,
+  "adversarial_correct": 2,
+  "adversarial_total": 2,
+  "note": "Harness workers are scripted fixers. These numbers measure the manager pipeline (dispatch, verify, receipt), not model capability. Real CLI adapters are exercised with stub CLIs in the adapter tests. Honest tasks must close; adversarial tasks (cheating worker, unfixable task) must escalate."
+}</code></pre>
+</details>
+
+<h2>Run it yourself</h2>
+<pre><code>git clone https://github.com/TamTunnel/crewwatch.git
+cd crewwatch
+go build -o build/crewwatch ./cmd/crewwatch
+
+# Add a goal (JSON spec; see examples/goal.json)
+./build/crewwatch goal add --spec examples/goal.json
+
+# Run the daemon (leave it running; it picks up goals and works them)
+./build/crewwatch daemon
+
+# Check progress, verify receipts, run the benchmark
+./build/crewwatch status
+./build/crewwatch verify --all
+./build/crewwatch eval --out eval/results</code></pre>
+
+<p class="small">Source: <a href="https://github.com/TamTunnel/crewwatch">github.com/TamTunnel/crewwatch</a> · Apache-2.0 · Demo runs recorded with the Crewwatch binary, November 2026. The demo video replays verbatim terminal output from those runs.</p>
+</body>
+</html>
