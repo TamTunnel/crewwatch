@@ -315,7 +315,14 @@ EOF`
 	}
 	runIdle(t, mgr)
 	// Grep the WHOLE state dir, including the SQLite DB file, for
-	// every secret value the worker could have leaked.
+	// every secret value the worker could have leaked. The exact-value
+	// checks run on every file, binary included. The heuristic
+	// ContainsSecret check runs only on text files: raw SQLite bytes
+	// can carve out an exactly-40-char base64 window from a title
+	// adjacent to a path ("fix Add" + "/tmp/.../001"), which is a
+	// path fragment, not a secret — see TestRedactNewTokenShapes.
+	// (ContainsSecret is only ever applied to text in production:
+	// specs, transcripts, receipts, audit log.)
 	secrets := []string{
 		"CANARY-SECRET-987", "tok-live-9f8e7d6c5b4a3f2e1d0c",
 		"BEARER-FAKE-TOKEN-1234567890abcdef", "xoxb-123456789012-abcdef",
@@ -333,6 +340,9 @@ EOF`
 			if strings.Contains(string(raw), s) {
 				t.Errorf("secret %q leaked into %s", s, path)
 			}
+		}
+		if strings.HasSuffix(path, ".db") || strings.HasSuffix(path, ".db-wal") || strings.HasSuffix(path, ".db-shm") {
+			return nil
 		}
 		if redact.ContainsSecret(string(raw)) {
 			t.Errorf("secret pattern in %s", path)

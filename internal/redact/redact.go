@@ -95,6 +95,27 @@ func isTokenRun(s string, loc []int) bool {
 	if strings.HasPrefix(m, "/") {
 		return false
 	}
+	// A purely numeric path segment (e.g. /001/) marks a filesystem
+	// path fragment, not a token: SQLite record bytes can place a title
+	// ("fix Add") adjacent to a path ("/tmp/TestSecretRedaction<digits>/001"),
+	// carving out an exactly-40-char base64 window when the temp-dir
+	// suffix has 9 digits. A real bare token's slash-separated segments
+	// are mixed-case high-entropy strings, never all digits.
+	for _, seg := range strings.Split(m, "/") {
+		if seg == "" {
+			continue
+		}
+		allDigits := true
+		for _, c := range seg {
+			if c < '0' || c > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return false
+		}
+	}
 	if loc[1] < len(s) {
 		if s[loc[1]] == '/' {
 			return false

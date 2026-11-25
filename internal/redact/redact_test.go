@@ -68,6 +68,18 @@ func TestRedactNewTokenShapes(t *testing.T) {
 	if ContainsSecret("wrote " + p) {
 		t.Fatalf("filesystem path wrongly detected as a secret: %q", p)
 	}
+	// A 40-char window of a longer path is a path fragment, not a
+	// token: SQLite record bytes place a title ("fix Add") adjacent to
+	// a path ("/tmp/TestSecretRedaction<9 digits>/001"), which carves
+	// out exactly 40 base64 chars when the temp-dir suffix has 9
+	// digits. That fragment contains a numeric path segment (/001/).
+	p = "fix Add/tmp/TestSecretRedaction283704322/001"
+	if got := String("wrote " + p); !strings.Contains(got, p) {
+		t.Fatalf("path fragment was wrongly redacted: %q", got)
+	}
+	if ContainsSecret("wrote " + p) {
+		t.Fatalf("path fragment wrongly detected as a secret: %q", p)
+	}
 }
 
 func TestRedactLeavesNormalText(t *testing.T) {
